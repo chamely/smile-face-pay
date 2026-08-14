@@ -4,9 +4,17 @@ import numpy as np
 from config import RECOGNITION_THRESHOLD
 
 class FaceEngine:
-    def __init__(self, det_size=(320, 320)):
-        self.app = FaceAnalysis(name="buffalo_l")
-        self.app.prepare(ctx_id=-1, det_size=det_size)  # ctx_id=-1 → CPU
+    def __init__(self, det_size=(320, 320), providers=None):
+        # providers 예:
+        #   CPU        → ["CPUExecutionProvider"]
+        #   CUDA(GPU)  → ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        #   TensorRT   → ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+        if providers is None:
+            providers = ["CPUExecutionProvider"]
+        self.app = FaceAnalysis(name="buffalo_l", providers=providers)
+        # ctx_id는 CPU면 -1, GPU EP면 0
+        ctx = -1 if providers[0] == "CPUExecutionProvider" else 0
+        self.app.prepare(ctx_id=ctx, det_size=det_size)
 
     def get_face(self, image_bgr):
         """가장 큰 얼굴 1개. face 객체에 kps, normed_embedding 포함."""
