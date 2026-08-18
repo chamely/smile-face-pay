@@ -1,17 +1,17 @@
 """
-Toss Smile Pay — Gradio 단말기형 데모 UI (v4)
+Smile Face Pay — Gradio 단말기형 데모 UI (v5, 서버 추론)
 - 좌: 단말기(브랜드 + 웹캠 + 상태바 + 등록/결제 버튼)
 - 우: 입력 패널(이름, 결제 금액) + 적립 결과 카드
+- 추론은 원격 GPU 서버(FastAPI)가 담당. 이 앱은 프레임을 서버로 보내고
+  결과(임베딩·표정·품질)를 받아 신원매칭/적립/DB를 처리하는 클라이언트.
 - 깜빡임 방지: 웹캠 stream은 세션(State)만 갱신하고,
   화면 HTML은 Timer가 '값이 바뀔 때만' 다시 그림.
-- 무표정→웃음 자동 감지(결제 시 2초 관찰 후 최고 미소로 확정),
-  등록 중복 시 덮어쓰기 확인 플로우.
-
-실제 모델(InsightFace, HSEmotion)은 로컬에서 로드됩니다.
-가중치/웹캠이 없는 환경에서는 자동으로 mock 백엔드로 폴백합니다.
 """
 import time
+import base64
 import numpy as np
+import cv2
+import requests
 import gradio as gr
 
 from config import RECOGNITION_THRESHOLD
@@ -20,41 +20,44 @@ from src.reward import calc_reward
 from src.database import load_db, save_db
 
 # ------------------------------------------------------------------
-# 백엔드 로드: 실제 모델 우선, 실패 시 mock 폴백
+# 추론 서버 주소
+#   - 데스크탑에서 로컬 검증: "http://localhost:8000"
+#   - 노트북에서 데스크탑 접속: "http://172.30.1.3:8000"
 # ------------------------------------------------------------------
-try:
-    from src.face_engine import FaceEngine
-    from src.expression import SmileScorer
-    from src.utils import align_face
-    _engine = FaceEngine()
-    _scorer = SmileScorer()
-    BACKEND = "real"
+SERVER_URL = "http://172.30.1.3:8000"
+BACKEND = f"server({SERVER_URL})"
 
 
-    def analyze(frame_bgr):
-        face = _engine.get_face(frame_bgr)
-        if face is None:
-            return None
-        emb = _engine.embedding(face)
-        aligned = align_face(frame_bgr, face.kps)
-        raw_happy = _scorer.raw_happy_prob(aligned)
-        return {"emb": emb, "raw_happy": raw_happy,
-                "face": face, "shape": frame_bgr.shape}
+def analyze(frame_bgr, strict=True):
+    """프레임을 서버로 보내 추론 결과를 받는다."""
+    ok, buf = cv2.imencode(".png", frame_bgr)
+    if not ok:
+        return {"error": "encode_failed"}
+    b64 = base64.b64encode(buf).decode("ascii")
+    try:
+        r = requests.post(f"{SERVER_URL}/analyze",
+                          json={"image_b64": b64, "strict": strict},
+                          timeout=10)
+        r.raise_for_status()
+        return r.json()   # {face, quality_ok?, emb?, raw_happy?, latency_ms?, reason?}
+    except Exception as e:
+        return {"error": str(e)}
 
-except Exception as e:
-    from src.mock_models import fake_embedding, fake_happy_prob
-    BACKEND = f"mock ({type(e).__name__})"
+def crop_to_display(frame_rgb):
+    """화면 표시(4:5)와 동일하게 원본 프레임을 center-crop."""
+    h, w = frame_rgb.shape[:2]
+    target_ratio = 4 / 5          # CSS aspect-ratio와 일치
+    cur_ratio = w / h
+    if cur_ratio > target_ratio:  # 너무 넓음 → 좌우 자름
+        new_w = int(h * target_ratio)
+        x0 = (w - new_w) // 2
+        return frame_rgb[:, x0:x0 + new_w]
+    else:                          # 너무 높음 → 위아래 자름
+        new_h = int(w / target_ratio)
+        y0 = (h - new_h) // 2
+        return frame_rgb[y0:y0 + new_h, :]
 
-
-    def analyze(frame_bgr):
-        seed = 1
-        smiling = bool(frame_bgr is not None and frame_bgr.mean() > 127)
-        return {"emb": fake_embedding(seed),
-                "raw_happy": fake_happy_prob(seed, smiling),
-                "face": None, "shape": None}
-
-
-SMILE_FRAMES = 3          # 웃음 측정에 모을 프레임 수(처리 프레임 기준)
+SMILE_FRAMES = 6          # 웃음 측정에 모을 프레임 수(처리 프레임 기준)
 
 # ------------------------------------------------------------------
 # 세션 상태
@@ -84,27 +87,34 @@ def step(frame, sess):
         sess["msg"] = "카메라 신호 없음"
         return sess
 
-    info = analyze(frame[:, :, ::-1].copy())  # RGB→BGR
-    if info is None:
+    # 단계별 품질 게이트 강도: 등록=엄격, 결제 신원확인=완화
+    strict = (sess["mode"] == "register")
+    frame_cropped = crop_to_display(frame)      # 화면과 동일 영역만
+    info = analyze(frame_cropped[:, :, ::-1].copy(), strict=strict)
+
+    if info.get("error"):
+        sess["msg"] = f"서버 연결 오류: {info['error'][:40]}"
+        return sess
+    if not info.get("face"):
         sess["msg"] = "얼굴을 화면 중앙에 맞춰주세요."
         return sess
+    if info.get("quality_ok") is False:
+        sess["msg"] = info.get("reason", "얼굴 품질을 확인해주세요")
+        return sess
+
+    # 서버가 준 임베딩(리스트)을 numpy로 복원
+    emb = np.array(info["emb"], dtype=np.float32)
+    raw_happy = info["raw_happy"]
 
     db = load_db()
 
     # 1) 무표정 단계
     if stage == "await_neutral":
-        sess["neutral_raw"] = info["raw_happy"]
-        sess["emb_neutral"] = info["emb"]
+        sess["neutral_raw"] = raw_happy
+        sess["emb_neutral"] = emb
 
         if sess["mode"] == "pay":
-            if info.get("face") is not None:
-                ok, reason = _engine.assess_quality(
-                    info["face"], info["shape"], strict=False)
-                if not ok:
-                    sess["msg"] = reason
-                    return sess
-
-            uid, sim = match(info["emb"], db)
+            uid, sim = match(emb, db)
             if uid is None:
                 sess["stage"] = "done"
                 sess["result"] = {"status": "unknown", "similarity": round(sim, 3)}
@@ -116,31 +126,23 @@ def step(frame, sess):
             sess["msg"] = f"{uid}님 확인됨 — 이제 활짝 웃어주세요 😊"
             return sess
         else:  # register
-            # 등록 품질 게이트 (real 백엔드에서만; mock은 face=None → 스킵)
-            if info.get("face") is not None:
-                ok, reason = _engine.assess_quality(info["face"], info["shape"])
-                if not ok:
-                    sess["msg"] = reason
-                    return sess
-
-            uid, sim = match(info["emb"], db)
+            uid, sim = match(emb, db)
             if uid is not None:
                 sess["stage"] = "await_overwrite"
                 sess["conflict_id"] = uid
-                sess["baseline"] = info["raw_happy"]
+                sess["baseline"] = raw_happy
                 sess["result"] = {"status": "confirm_overwrite",
                                   "matched": uid, "similarity": round(sim, 3)}
                 sess["msg"] = f"이미 '{uid}'로 등록된 얼굴입니다."
                 return sess
-            sess["baseline"] = info["raw_happy"]
+            sess["baseline"] = raw_happy
             sess["stage"] = "confirm_register"
             sess["msg"] = "무표정 확인 — 등록을 마무리합니다."
             return sess
 
-    # 2) 웃음 단계(결제): 실제 처리 프레임 N장을 모아 최고 미소로 확정
-    #    (시간 기준이면 CPU 추론이 느릴 때 측정 구간을 건너뛰므로 프레임 수 기준)
+    # 2) 웃음 단계(결제): 처리 프레임 N장을 모아 최고 미소로 확정
     if stage == "await_smile":
-        s_now = smile_score(info["raw_happy"], sess["baseline"])
+        s_now = smile_score(raw_happy, sess["baseline"])
         sess["best_smile"] = max(sess["best_smile"], s_now)
         sess["smile_frames"] = sess.get("smile_frames", 0) + 1
 
