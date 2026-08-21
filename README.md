@@ -62,7 +62,7 @@
 
 추론(GPU)과 입력(웹캠)을 물리적으로 분리한 구조입니다.
 
-'''mermaid
+```mermaid
 graph LR
     subgraph 노트북 [노트북 - 클라이언트]
         A[Gradio UI + 웹캠] --> B[프레임 캡처<br/>base64 인코딩]
@@ -75,7 +75,7 @@ graph LR
     B -- POST --> C
     C --> D
     D -- JSON<br/>emb, raw_happy, latency_ms --> F
-'''
+```
 
 <!-- 이미지 자리: 위 구조를 그린 아키텍처 다이어그램 (직접 그린 것이 있다면 교체) -->
 
